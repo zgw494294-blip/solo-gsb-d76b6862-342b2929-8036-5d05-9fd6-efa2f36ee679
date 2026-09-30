@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>闭环供水管网平衡台</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <h1>闭环供水管网平衡台</h1>
+      <p class="subtitle">录入节点与管段，求解稳态水头、带符号管流量与水源总供水量（压降定律 H<sub>起</sub>−H<sub>终</sub> = r·q·|q|）</p>
+    </div>
+    <div class="topbar-actions">
+      <label class="minhead-field">
+        最低水头限值
+        <input type="number" id="minHeadInput" step="any" value="0" title="低于该水头的节点将在图与表中标红" />
+      </label>
+      <button id="sampleBtn" class="btn" type="button">载入示例</button>
+      <button id="resetBtn" class="btn btn-ghost" type="button">重置</button>
+      <button id="solveBtn" class="btn btn-primary" type="button">求解</button>
+      <button id="outageBtn" class="btn" type="button" title="逐根评估每根管段被单独停用的后果">停管分析</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <!-- 左侧：可编辑表格 -->
+    <section class="panel panel-inputs">
+      <div class="panel-head">
+        <h2>节点 <span class="hint" id="nodeCount">2～10 个，恰 1 个水源</span></h2>
+        <button id="addNodeBtn" class="btn btn-small" type="button">+ 添加节点</button>
+      </div>
+      <div class="table-wrap">
+        <table class="grid" id="nodeTable">
+          <thead>
+            <tr>
+              <th>编号</th>
+              <th>类型</th>
+              <th class="num-col">固定水头</th>
+              <th class="num-col">需水量</th>
+              <th class="op-col"></th>
+            </tr>
+          </thead>
+          <tbody id="nodeTbody"></tbody>
+        </table>
+      </div>
+
+      <div class="panel-head second">
+        <h2>管段 <span class="hint" id="pipeCount">1～16 根，阻力 r &gt; 0</span></h2>
+        <button id="addPipeBtn" class="btn btn-small" type="button">+ 添加管段</button>
+      </div>
+      <div class="table-wrap">
+        <table class="grid" id="pipeTable">
+          <thead>
+            <tr>
+              <th>编号</th>
+              <th>起点</th>
+              <th>终点</th>
+              <th class="num-col">阻力 r</th>
+              <th class="op-col"></th>
+            </tr>
+          </thead>
+          <tbody id="pipeTbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 右侧：网络图 -->
+    <section class="panel panel-diagram">
+      <div class="panel-head">
+        <h2>网络图 <span class="hint">可拖动节点调整布局</span></h2>
+        <button id="relayoutBtn" class="btn btn-small" type="button">重新布局</button>
+      </div>
+      <div id="diagramBox" class="diagram-box">
+        <svg id="networkSvg" xmlns="http://www.w3.org/2000/svg"></svg>
+      </div>
+      <div class="legend">
+        <span><i class="lg lg-source"></i>水源（固定水头）</span>
+        <span><i class="lg lg-demand"></i>用水节点</span>
+        <span><i class="lg lg-low"></i>低于最低水头</span>
+        <span><i class="arrow-demo">→</i> 实际流向（数字为带符号流量 q）</span>
+      </div>
+    </section>
+
+    <!-- 下方：状态与结果 -->
+    <section class="panel panel-status" id="statusPanel">
+      <div id="banner" class="banner banner-idle">填写数据后点击“求解”。所有数值必须为有限数，且管网为无向连通图。</div>
+    </section>
+
+    <section class="panel panel-results" id="resultsPanel" hidden>
+      <div class="summary-grid" id="summaryGrid"></div>
+
+      <h3>节点结果</h3>
+      <div class="table-wrap">
+        <table class="grid result-grid" id="nodeResultTable">
+          <thead>
+            <tr>
+              <th>节点</th><th>类型</th><th class="num-col">水头 H</th>
+              <th class="num-col">需水量 d</th><th class="num-col">净流入</th>
+              <th class="num-col">守恒残差</th><th>状态</th>
+            </tr>
+          </thead>
+          <tbody id="nodeResultTbody"></tbody>
+        </table>
+      </div>
+
+      <h3>管段结果</h3>
+      <div class="table-wrap">
+        <table class="grid result-grid" id="pipeResultTable">
+          <thead>
+            <tr>
+              <th>管段</th><th>录入方向</th><th class="num-col">阻力 r</th>
+              <th class="num-col">带符号流量 q</th><th>实际流向</th>
+              <th class="num-col">H起−H终</th><th class="num-col">压降定律残差</th>
+            </tr>
+          </thead>
+          <tbody id="pipeResultTbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 逐根停管情景分析 -->
+    <section class="panel panel-outage" id="outagePanel" hidden>
+      <div class="panel-head">
+        <h2>逐根停管分析 <span class="hint">每根管段单独停用的独立情景，按风险排序</span></h2>
+      </div>
+      <div class="summary-grid" id="outageSummary"></div>
+      <div class="table-wrap">
+        <table class="grid result-grid" id="outageTable">
+          <thead>
+            <tr>
+              <th class="num-col">风险序</th>
+              <th>停用管段</th>
+              <th>情景状态</th>
+              <th>失供节点 / 失供需水量</th>
+              <th class="num-col">最低用水节点水头</th>
+              <th>低于限值节点</th>
+              <th>比基线新增低水头节点</th>
+            </tr>
+          </thead>
+          <tbody id="outageTbody"></tbody>
+        </table>
+      </div>
+      <p class="hint" id="outageNote">
+        排序规则：断联情景按失供需水量降序在前；连通情景按最低用水节点水头升序随后；同分保持管段录入顺序；不收敛情景单独标明并排最后。
+      </p>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
