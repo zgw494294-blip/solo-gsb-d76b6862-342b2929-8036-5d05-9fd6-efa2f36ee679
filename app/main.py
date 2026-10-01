@@ -1,4 +1,5 @@
-"""FastAPI 入口：/api/solve 与 /api/analyze-outages 负责校验与求解，其余路径提供原生前端静态页面。"""
+"""FastAPI 入口：/api/solve 等接口负责校验与求解，/api/isolation-jobs 提供
+可逐步执行的停管隔离作业（单进程内存），其余路径提供原生前端静态页面。"""
 
 from __future__ import annotations
 
@@ -10,6 +11,12 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from .isolation import (
+    IsolationRuleError,
+    IsolationStore,
+    JobNotFoundError,
+    VersionConflictError,
+)
 from .solver import (
     SolverNotConverged,
     ValidationError,
@@ -130,6 +137,63 @@ async def plan_resupply_endpoint(request: Request) -> JSONResponse:
                             content={"ok": False, "error": str(exc)})
 
     return JSONResponse(content={"ok": True, "resupply_analysis": analysis})
+
+
+# --------------------------------------------------------------------------- #
+# 停管隔离作业（仅存于单进程内存，重启即清空；不提供页面）
+# --------------------------------------------------------------------------- #
+isolation_store = IsolationStore()
+
+
+@app.post("/api/isolation-jobs")
+async def create_isolation_job(request: Request) -> JSONResponse:
+    """创建停管隔离作业：管段初始全开；初始欠压或不收敛时不创建作业。"""
+    payload, bad = await _load_payload(request)
+    if bad is not None:
+        return bad
+
+    try:
+        snapshot = isolation_store.create(payload)
+    except (ValidationError, IsolationRuleError, SolverNotConverged) as exc:
+        return JSONResponse(status_code=422,
+                            content={"ok": False, "error": str(exc)})
+
+    return JSONResponse(content={"ok": True, "job": snapshot})
+
+
+@app.get("/api/isolation-jobs/{job_id}")
+def read_isolation_job(job_id: str) -> JSONResponse:
+    """读取作业当前版本快照（关闭管段、失供节点、连通区稳态结果）。"""
+    try:
+        snapshot = isolation_store.get(job_id)
+    except JobNotFoundError as exc:
+        return JSONResponse(status_code=404,
+                            content={"ok": False, "error": str(exc)})
+
+    return JSONResponse(content={"ok": True, "job": snapshot})
+
+
+@app.post("/api/isolation-jobs/{job_id}/toggle")
+async def toggle_isolation_pipe(job_id: str, request: Request) -> JSONResponse:
+    """携带当前版本切换一根现有管段的开闭；版本不一致时返回 409。"""
+    payload, bad = await _load_payload(request)
+    if bad is not None:
+        return bad
+
+    try:
+        snapshot = isolation_store.toggle(job_id, payload)
+    except JobNotFoundError as exc:
+        return JSONResponse(status_code=404,
+                            content={"ok": False, "error": str(exc)})
+    except VersionConflictError as exc:
+        return JSONResponse(status_code=409, content={
+            "ok": False, "error": str(exc),
+            "current_version": exc.current_version})
+    except (ValidationError, IsolationRuleError, SolverNotConverged) as exc:
+        return JSONResponse(status_code=422,
+                            content={"ok": False, "error": str(exc)})
+
+    return JSONResponse(content={"ok": True, "job": snapshot})
 
 
 # 静态资源（index.html / style.css / app.js）——该路由必须最后注册
