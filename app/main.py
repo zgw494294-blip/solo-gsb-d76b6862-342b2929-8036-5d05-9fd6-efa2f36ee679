@@ -1,4 +1,4 @@
-"""FastAPI 入口：/api/solve 与 /api/analyze-outages 负责校验与求解，其余路径提供原生前端静态页面。"""
+"""FastAPI 入口：/api/solve 等求解接口、/api/isolation-jobs 停管隔离作业接口，其余路径提供原生前端静态页面。"""
 
 from __future__ import annotations
 
@@ -10,6 +10,14 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from .isolation import (
+    IsolationRuleError,
+    JobNotFoundError,
+    VersionConflictError,
+    create_job,
+    get_snapshot,
+    toggle_pipe,
+)
 from .solver import (
     SolverNotConverged,
     ValidationError,
@@ -38,12 +46,14 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-async def _load_payload(request: Request) -> tuple[Any, JSONResponse | None]:
+async def _load_payload(request: Request, *, empty_hint: str | None = None
+                        ) -> tuple[Any, JSONResponse | None]:
     """读取原始请求体并解析 JSON；任何问题转成统一的 400 响应。"""
     raw = await request.body()
     if not raw:
         return None, JSONResponse(status_code=400, content={
-            "ok": False, "error": "请求体为空，请先填写节点与管段数据。"})
+            "ok": False,
+            "error": empty_hint or "请求体为空，请先填写节点与管段数据。"})
     try:
         payload = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
     except (ValueError, UnicodeDecodeError) as exc:
@@ -130,6 +140,75 @@ async def plan_resupply_endpoint(request: Request) -> JSONResponse:
                             content={"ok": False, "error": str(exc)})
 
     return JSONResponse(content={"ok": True, "resupply_analysis": analysis})
+
+
+# --------------------------------------------------------------------------- #
+# 停管隔离作业（仅存于单进程内存，重启即清空；无对应页面）
+# --------------------------------------------------------------------------- #
+_ISOLATION_ERRORS = (
+    ValidationError,
+    IsolationRuleError,
+    SolverNotConverged,
+    VersionConflictError,
+    JobNotFoundError,
+)
+
+
+def _isolation_error(exc: Exception) -> JSONResponse:
+    """把停管隔离作业的各类失败映射为统一的中文错误响应（作业状态保持原状）。"""
+    if isinstance(exc, JobNotFoundError):
+        return JSONResponse(status_code=404, content={
+            "ok": False,
+            "error": f"停管隔离作业“{exc.args[0]}”不存在"
+                     "（作业仅存于单进程内存，服务重启后即清空）。"})
+    if isinstance(exc, VersionConflictError):
+        return JSONResponse(status_code=409, content={
+            "ok": False, "error": str(exc), "current_version": exc.current})
+    return JSONResponse(status_code=422,
+                        content={"ok": False, "error": str(exc)})
+
+
+@app.post("/api/isolation-jobs")
+async def create_isolation_job(request: Request) -> JSONResponse:
+    """创建停管隔离作业：沿用校验与稳态求解，初始欠压或不收敛则不创建。"""
+    payload, bad = await _load_payload(request)
+    if bad is not None:
+        return bad
+    try:
+        snapshot = create_job(payload)
+    except _ISOLATION_ERRORS as exc:
+        return _isolation_error(exc)
+    return JSONResponse(content={"ok": True, "job": snapshot})
+
+
+@app.get("/api/isolation-jobs/{job_id}")
+async def read_isolation_job(job_id: str) -> JSONResponse:
+    """读取作业当前版本的完整快照；快照整体来自同一版本，绝不混合不同版本的数据。"""
+    try:
+        snapshot = get_snapshot(job_id)
+    except JobNotFoundError as exc:
+        return _isolation_error(exc)
+    return JSONResponse(content={"ok": True, "job": snapshot})
+
+
+@app.post("/api/isolation-jobs/{job_id}/toggle")
+async def toggle_isolation_pipe(job_id: str, request: Request) -> JSONResponse:
+    """携带当前版本切换一根现有管段的开闭；成功才提交新版本，失败全部保持原状。"""
+    payload, bad = await _load_payload(
+        request, empty_hint="请求体为空，请提供 version（作业当前版本号）与 pipe_id。")
+    if bad is not None:
+        return bad
+    try:
+        snapshot = toggle_pipe(job_id, payload)
+    except _ISOLATION_ERRORS as exc:
+        return _isolation_error(exc)
+    pipe_id = payload["pipe_id"].strip()
+    return JSONResponse(content={
+        "ok": True,
+        "toggled_pipe": pipe_id,
+        "toggled_to": "closed" if pipe_id in snapshot["closed_pipes"] else "open",
+        "job": snapshot,
+    })
 
 
 # 静态资源（index.html / style.css / app.js）——该路由必须最后注册

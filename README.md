@@ -83,6 +83,9 @@ H_i − H_j = r_p · q_p · |q_p|
 | `POST` | `/api/analyze-outages` | 入参与 `/api/solve` 相同；先求基线，再对每根管段各评估一个“单独停用”情景并按风险排序返回 |
 | `POST` | `/api/locate-leak` | 入参为管网参数 + `measurements`（2～8 个互异用水节点的实测水头）+ 正的 `leak_upper_bound`；逐用水节点拟合单点漏量并按测点误差排序 |
 | `POST` | `/api/plan-resupply` | 入参为管网参数 + `resupply_nodes`（2～6 个互异、表内需水量为正的用水节点）；先求停供基线，再枚举包含空集在内的全部复供组合，返回恢复需水量总量最大的可行组合 |
+| `POST` | `/api/isolation-jobs` | 创建停管隔离作业：入参为管网参数 + 可选 `allow_unserved`（允许暂时失供的用水节点数组，可为空）；管段初始全开，初始有用水节点欠压或不收敛则不创建；返回作业 ID 与版本 0 快照 |
+| `GET` | `/api/isolation-jobs/{job_id}` | 读取作业当前版本的完整快照（关闭管段、失供节点、连通区稳态结果）；作业不存在返回 `404` |
+| `POST` | `/api/isolation-jobs/{job_id}/toggle` | 入参 `{"version", "pipe_id"}`：切换一根现有管段的开闭；规则满足且收敛才提交（关闭集合+版本+1+稳态结果），否则全部保持原状；版本不一致返回 `409` |
 | `GET` | `/api/health` | 健康检查 |
 
 请求示例：
@@ -373,6 +376,131 @@ curl -s http://localhost:8000/api/plan-resupply \
 `resupply_nodes` 不是数组、原有管网校验未通过等）返回 `422`/`400` 并附中文原因；
 基线欠压与“无法确认最优”属于业务结论，HTTP 状态码仍为 `200`，请依据 `status` 字段区分。
 
+### 停管隔离作业 `POST /api/isolation-jobs`（分步停管/复管）
+
+> 停管隔离作业与求解共用同一服务、同一端口，**不需要任何额外服务或新的启动步骤**——
+> `docker compose up --build` 后即可直接调用。作业**只保存在单进程内存中，服务重启
+> 即全部清空**；该功能仅提供 HTTP API，**没有对应页面**。
+
+一次“停管隔离作业”表示对同一张现有管网进行**一系列逐步的停管/复管操作**：
+
+1. **创建作业** `POST /api/isolation-jobs`：请求体在 `/api/solve` 参数之外可带
+   `allow_unserved`——**允许暂时失供的现有用水节点编号数组（可为空数组或省略）**。
+   管段初始全部开启；后端沿用同一套校验与稳态求解，**初始状态下只要有用水节点欠压
+   （水头低于 `min_head`）或求解不收敛，就不创建作业**（返回 `422` 与中文原因）。
+   创建成功返回作业 `job_id` 与初始 `version: 0` 的完整状态快照。
+2. **读取状态** `GET /api/isolation-jobs/{job_id}`：返回该作业当前版本的完整快照，
+   快照整体取自同一版本，**绝不混合不同版本的数据**；作业不存在返回 `404`。
+3. **切换一根管段** `POST /api/isolation-jobs/{job_id}/toggle`：请求体
+   `{"version": 当前版本号, "pipe_id": "现有管段编号"}`，把该管段**由开转关或由关转开**。
+   后端按**全部关闭管段**重新计算水源连通区并校验：
+   - **失供节点**（与水源断开的用水节点）必须全部在 `allow_unserved` 集合内；
+   - 连通区内用水节点**按原需水量**重新稳态求解，且**任何用水节点不得欠压**；
+   - 失供节点**保留原需水量**，重新连通后自动恢复参与求解；
+   - 连通区**仅剩水源时供水量为零**（不再调用求解器）。
+
+   全部满足才**一次性提交**：关闭集合更新、`version` 加一、稳态结果替换；非法操作
+   （未知管段、版本号类型错误等）、求解不收敛或上述规则不满足时，**关闭集合、版本号、
+   稳态结果全部保持原状**，返回 `422` 并说明原因。`version` 与当前版本不一致时返回
+   **`409`**——**同一版本的并发切换最多成功一次**，先到者成功，其余一律 `409`，
+   请重新读取最新状态后再试。
+
+每次成功响应都返回最新快照，主要字段：`closed_pipes` / `open_pipes` / `pipe_states`
+（关闭管段与逐管开闭）、`unserved_nodes` / `unserved_demand`（失供节点与失供量之和）、
+`component_nodes` / `component_pipes`（水源连通区）、`source_only`、`source_supply` /
+`total_demand`，以及 `solution`（连通区上的完整稳态解，结构与 `/api/solve` 的
+`result` 相同；仅剩水源时为供水量为零的平凡解）。
+
+#### 操作示例
+
+以树状网 `S(50) ─P1→ A(需2) ─P2→ B(需3)` 为例，允许 B 暂时失供：
+
+```bash
+# 1) 创建作业（管段初始全开），记下返回的 job_id
+curl -s -X POST http://localhost:8000/api/isolation-jobs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "min_head": 0,
+    "nodes": [
+      {"id": "S", "type": "source", "head": 50.0},
+      {"id": "A", "type": "demand", "demand": 2.0},
+      {"id": "B", "type": "demand", "demand": 3.0}
+    ],
+    "pipes": [
+      {"id": "P1", "start": "S", "end": "A", "r": 1.0},
+      {"id": "P2", "start": "A", "end": "B", "r": 1.0}
+    ],
+    "allow_unserved": ["B"]
+  }'
+```
+
+返回（节选）：初始版本 0，无关闭管段、无失供节点，供水量 5：
+
+```json
+{"ok": true, "job": {"job_id": "05ced70d…（每次创建随机生成）", "version": 0,
+ "closed_pipes": [], "unserved_nodes": [], "component_nodes": ["S", "A", "B"],
+ "source_supply": 5.0, "total_demand": 5.0}}
+```
+
+```bash
+# 2) 携带当前版本关闭 P2：B 失供但在允许集合内，操作成功，版本 0 → 1
+curl -s -X POST http://localhost:8000/api/isolation-jobs/<job_id>/toggle \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 0, "pipe_id": "P2"}'
+```
+
+返回（节选）：连通区只剩 S、A，按原需水量求解，供水量降为 2：
+
+```json
+{"ok": true, "toggled_pipe": "P2", "toggled_to": "closed",
+ "job": {"version": 1, "closed_pipes": ["P2"], "unserved_nodes": ["B"],
+ "unserved_demand": 3.0, "component_nodes": ["S", "A"], "source_supply": 2.0}}
+```
+
+#### 冲突示例（同一版本最多成功一次）
+
+```bash
+# 3) 仍携带旧版本 0 再操作：版本已推进到 1，返回 409，状态不变
+curl -s -X POST http://localhost:8000/api/isolation-jobs/<job_id>/toggle \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 0, "pipe_id": "P1"}'
+```
+
+```json
+{"ok": false, "current_version": 1,
+ "error": "版本冲突：请求携带的版本为 0，作业当前版本已为 1；同一版本的切换最多成功一次，请重新读取最新状态后再试。"}
+```
+
+并发场景同理：多个客户端携带**同一版本**同时切换时，**最多一个成功**（版本 +1），
+其余全部收到 `409`，重新读取后再携带新版本重试。
+
+#### 规则不满足示例（全部保持原状）
+
+```bash
+# 4) 携带当前版本 1 关闭 P1：A 将失供但不在允许集合内，返回 422，状态不变
+curl -s -X POST http://localhost:8000/api/isolation-jobs/<job_id>/toggle \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 1, "pipe_id": "P1"}'
+```
+
+```json
+{"ok": false,
+ "error": "切换后用水节点 “A” 将失供，但其不在允许暂时失供的节点集合内；本次操作未生效，关闭集合、版本与稳态结果全部保持原状。"}
+```
+
+欠压（切换后连通区内有用水节点水头低于 `min_head`）与求解不收敛同样返回 `422`
+并全部保持原状；**失败不消耗版本号**，用同一版本改发合法操作仍可成功。
+
+```bash
+# 5) 重开 P2：B 恢复原需水量重新参与求解，供水量回到 5，版本 1 → 2
+curl -s -X POST http://localhost:8000/api/isolation-jobs/<job_id>/toggle \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 1, "pipe_id": "P2"}'
+
+# 6) 随时读取当前版本完整快照；服务重启后作业清空，再读返回 404
+curl -s http://localhost:8000/api/isolation-jobs/<job_id>
+```
+
 ## 输入约束汇总
 
 - 节点 2～10 个，编号为非空且唯一的字符串；
@@ -384,19 +512,26 @@ curl -s http://localhost:8000/api/plan-resupply \
   用水节点，实测水头为有限数值；`leak_upper_bound` 为正有限数。
 - 仅 `/api/plan-resupply` 额外要求：`resupply_nodes` 为 2～6 个互异节点编号，均为
   表内需水量为正的用水节点（不能是水源或零需水节点）；候选顺序按节点录入顺序归并。
+- 仅停管隔离作业：创建时 `allow_unserved` 为可选数组（可为空），元素为**互异的现有
+  用水节点**编号；切换时请求体为 `{"version": 非负整数, "pipe_id": 现有管段编号}`，
+  `version` 必须等于作业当前版本（同一版本最多成功切换一次，冲突返回 `409`）；
+  作业只存于单进程内存，重启即清空。
 
 ## 项目结构
 
 ```
 .
 ├── app/
-│   ├── main.py            # FastAPI 入口：/api/solve、/api/analyze-outages、/api/locate-leak、/api/plan-resupply、/api/health、静态页面
+│   ├── main.py            # FastAPI 入口：/api/solve、/api/analyze-outages、/api/locate-leak、/api/plan-resupply、/api/isolation-jobs（创建/读取/切换）、/api/health、静态页面
 │   ├── solver.py          # 输入校验 + Newton 稳态求解 + 1e-6 复核 + 逐根停管情景分析 + 单点漏损定位（黄金分割）+ 停供节点复供组合枚举
+│   ├── isolation.py       # 停管隔离作业：内存作业注册表、水源连通区计算、失供/欠压规则、版本乐观锁（并发同一版本最多成功一次）
 │   └── static/
 │       ├── index.html     # 原生页面（含停管分析入口与结果表）
 │       ├── style.css
 │       └── app.js         # 可编辑表格、力图布局、拖拽、流向绘制、停管分析
-├── tests/test_solver.py   # pytest：解析解、环状网、校验分支、API、随机压力测试、停管分析排序、漏损定位、复供组合优选
+├── tests/
+│   ├── test_solver.py     # pytest：解析解、环状网、校验分支、API、随机压力测试、停管分析排序、漏损定位、复供组合优选
+│   └── test_isolation.py  # pytest：停管隔离作业的创建/切换/规则/版本冲突/并发/快照一致性
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -409,4 +544,4 @@ pip install -r requirements.txt pytest httpx
 PYTHONPATH=. pytest -q
 ```
 
-测试包含单管解析解、反向录入符号、环状网独立复核、低水头标记、各类非法输入、`NaN` JSON 拒绝，以及 60 个随机连通管网（2～10 节点、最多 16 管、阻力跨 6 个数量级）的收敛性与残差检查；停管分析部分覆盖树状网全断联按失供量排序、环+枝混合分组排序、比基线新增低水头节点、同分保持录入顺序、单情景不收敛单独排最后，以及 `/api/analyze-outages` 的 200/422/400 分支；漏损定位部分覆盖真值漏点与漏量回收、无漏损基线 RMSE=0 不判漏、对称网络多候选无法区分、最优漏量落在上限端点、测点/上限各类非法输入、基线不收敛整体报错、单候选失败隔离排最后，以及 `/api/locate-leak` 的 200/422/400 分支；复供优选部分覆盖可行组合按恢复总量排序、总量同分先比节点数再按录入顺序字典序、空集最优、基线欠压无法复供、非候选节点需水不变、基线不收敛与单组合不收敛的“无法确认最优”区分（求解失败不计欠压）、候选 2～6 个/互异/正需水等校验分支，以及 `/api/plan-resupply` 的 200/422/400 分支。
+测试包含单管解析解、反向录入符号、环状网独立复核、低水头标记、各类非法输入、`NaN` JSON 拒绝，以及 60 个随机连通管网（2～10 节点、最多 16 管、阻力跨 6 个数量级）的收敛性与残差检查；停管分析部分覆盖树状网全断联按失供量排序、环+枝混合分组排序、比基线新增低水头节点、同分保持录入顺序、单情景不收敛单独排最后，以及 `/api/analyze-outages` 的 200/422/400 分支；漏损定位部分覆盖真值漏点与漏量回收、无漏损基线 RMSE=0 不判漏、对称网络多候选无法区分、最优漏量落在上限端点、测点/上限各类非法输入、基线不收敛整体报错、单候选失败隔离排最后，以及 `/api/locate-leak` 的 200/422/400 分支；复供优选部分覆盖可行组合按恢复总量排序、总量同分先比节点数再按录入顺序字典序、空集最优、基线欠压无法复供、非候选节点需水不变、基线不收敛与单组合不收敛的“无法确认最优”区分（求解失败不计欠压）、候选 2～6 个/互异/正需水等校验分支，以及 `/api/plan-resupply` 的 200/422/400 分支；停管隔离作业部分覆盖创建（初始欠压/不收敛不创建、`allow_unserved` 校验与录入顺序归并）、切换管段的失供/欠压/不收敛规则（失败全部保持原状且不消耗版本）、失供节点保留原需水量并在重连后恢复、仅剩水源供水量为零、版本冲突 409、多线程并发同一版本最多成功一次、读取快照不混合版本、两作业相互独立，以及未知作业 404 与各类 400/422 分支。
